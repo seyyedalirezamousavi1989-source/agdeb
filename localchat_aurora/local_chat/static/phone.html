@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>اتصال گوشی</title>
+  <link rel="stylesheet" href="/static/remote.css">
+</head>
+<body class="remote-page">
+  <main class="remote-card wide">
+    <h1>استفاده از گوشی (PWA)</h1>
+    <p>وضعیت: <span class="pill" id="state">…</span> <a class="back-link" href="/">بازگشت به گفت‌وگو</a></p>
+
+    <div id="offBox" hidden>
+      <div class="warn-box">دسترسی از گوشی خاموش است. برای روشن‌کردن، برنامه را با <b dir="ltr">start_phone.bat</b> اجرا کنید (یا دکمهٔ زیر را بزنید و برنامه را یک بار ببندید و دوباره باز کنید).</div>
+      <button class="remote-btn" id="enableBtn" type="button">روشن‌کردن دسترسی از گوشی</button>
+    </div>
+
+    <div id="onBox" hidden>
+      <h2>۱) روی گوشی در Safari این آدرس را باز کنید</h2>
+      <ul class="url-list" id="urls"></ul>
+      <p id="noUrl" hidden>آدرس شبکه پیدا نشد؛ رایانه به Wi-Fi/شبکه وصل است؟</p>
+      <h2>۲) کد جفت‌سازی را آنجا وارد کنید</h2>
+      <div class="code-box" id="code">…</div>
+      <h2>۳) افزودن به صفحهٔ اصلی</h2>
+      <ol class="steps">
+        <li>در Safari دکمهٔ Share (مربع با فلش) را بزنید.</li>
+        <li>«Add to Home Screen» را انتخاب کنید و «Open as Web App» روشن باشد.</li>
+        <li>برنامه را از آیکون صفحهٔ اصلی باز کنید. اگر دوباره کد خواست، همان کد را بزنید (iOS حافظهٔ Safari و آیکون را جدا نگه می‌دارد).</li>
+      </ol>
+      <div class="warn-box">
+        <b>HTTPS:</b> روی آدرس <span dir="ltr">http://192.168…</span> چت کار می‌کند، اما iOS میکروفون و سرویس‌ورکر را فقط روی HTTPS می‌دهد. برای HTTPS روی همین رایانه و گوشی Tailscale نصب کنید و دستور <span dir="ltr">tailscale serve --bg 8000</span> را بزنید؛ سپس آدرس <span dir="ltr">https://اسم-رایانه.ts.net</span> را روی گوشی باز کنید (راهنمای کامل در PHONE_PWA_FA.md).
+      </div>
+      <h2>دستگاه‌های جفت‌شده</h2>
+      <div id="devices"></div>
+      <button class="remote-btn ghost" id="regenBtn" type="button">کد جدید بساز و همهٔ دستگاه‌ها را خارج کن</button>
+      <button class="remote-btn ghost" id="disableBtn" type="button">خاموش‌کردن دسترسی از گوشی</button>
+    </div>
+    <p class="remote-error" id="msg" role="status"></p>
+  </main>
+  <script src="/static/phone_admin.js" defer></script>
+</body>
+</html>
