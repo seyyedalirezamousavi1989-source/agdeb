@@ -39,6 +39,28 @@ PREFERRED_EMBED_MODELS = ("bge-m3", "qwen3-embedding", "nomic-embed-text", "mxba
 _EMBED_LIKE = re.compile(r"(embed|bge|nomic|minilm|e5-|arctic|snowflake|paraphrase-multilingual|mxbai|granite-embedding|gte-|jina|labse|sentence)", re.I)
 DEFAULT_SETTINGS = {"enabled": "1", "embed_model": "", "top_k": "5", "max_chars": "6500"}
 MIN_VECTOR_SIMILARITY = 0.38
+# Cosine scores are not comparable between embedding models: small/older ones (nomic, MiniLM, mxbai) score
+# genuinely relevant passages lower, so a single fixed cut-off silently discards correct hits.
+_LOW_SIMILARITY_MODELS = (("nomic-embed", 0.30), ("all-minilm", 0.28), ("minilm", 0.28), ("mxbai", 0.32),
+                          ("snowflake-arctic", 0.32), ("granite-embedding", 0.32))
+
+
+def min_similarity(model):
+    name = str(model or "").casefold()
+    for marker, value in _LOW_SIMILARITY_MODELS:
+        if marker in name:
+            return value
+    return MIN_VECTOR_SIMILARITY
+
+
+def embed_prefix(model, kind):
+    """Task prefix some embedding models were trained with (kind: 'query' or 'document'); '' when none is needed."""
+    name = str(model or "").casefold()
+    if "nomic-embed" in name:
+        return "search_query: " if kind == "query" else "search_document: "
+    if "e5-" in name or name.startswith("e5") or "multilingual-e5" in name:
+        return "query: " if kind == "query" else "passage: "
+    return ""
 
 _STOPWORDS = set("""و در به از که این را با است برای آن یک هم یا تا بر چه چی کی چرا چطور چگونه می های ها بود شد کرد باشد
 من تو او ما شما ایشان آیا اگر هر همه خود بین روی پس نیز دیگر هیچ بی
@@ -574,10 +596,12 @@ class KnowledgeBase:
         tokens = query_tokens(query)
         keyword = self._keyword_hits(tokens, 40, collection)
         vector = []
+        self.last_vector_error = ""
         if embed_query is not None and embed_model:
             try:
                 vector = self._vector_hits(embed_model, embed_query(query), 40, collection)
-            except Exception:
+            except Exception as exc:
+                self.last_vector_error = f"{type(exc).__name__}: {str(exc)[:200]}"
                 log.warning("vector search skipped", exc_info=True)
         fused, via = {}, {}
         need = 0.34 if len(tokens) >= 3 else 0.5
@@ -585,8 +609,9 @@ class KnowledgeBase:
             if covered >= need:
                 fused[cid] = fused.get(cid, 0.0) + 1.0 / (60 + rank)
                 via.setdefault(cid, set()).add("کلیدواژه")
+        cutoff = min_similarity(embed_model)
         for rank, (cid, similarity) in enumerate(vector):
-            if similarity >= MIN_VECTOR_SIMILARITY:
+            if similarity >= cutoff:
                 fused[cid] = fused.get(cid, 0.0) + 1.0 / (60 + rank)
                 via.setdefault(cid, set()).add("معنایی")
         if not fused:
@@ -678,7 +703,7 @@ class KnowledgeService:
         return [n for n in names if any(n.startswith(p) for p in PREFERRED_EMBED_MODELS) or _EMBED_LIKE.search(n)]
 
     def _embed_one(self, model, text):
-        vectors = self._embed(model, [text])
+        vectors = self._embed(model, [embed_prefix(model, "query") + text])
         return vectors[0]
 
     # --- background fill -------------------------------------------------------------------------
@@ -744,7 +769,9 @@ class KnowledgeService:
                     return
                 if not batch:
                     break
-                texts = [(f"{title} › {heading}\n{text}" if heading else f"{title}\n{text}")[:EMBED_TEXT_LIMIT] for _, heading, text, title in batch]
+                doc_prefix = embed_prefix(model, "document")
+                texts = [doc_prefix + (f"{title} › {heading}\n{text}" if heading else f"{title}\n{text}")[:EMBED_TEXT_LIMIT]
+                         for _, heading, text, title in batch]
                 try:
                     vectors = self._embed(model, texts)
                     if len(vectors) != len(batch):
@@ -771,6 +798,8 @@ class KnowledgeService:
         if stats["chunks"] and stats["embedded"] == stats["chunks"] and state.get("state") != "error":
             state["state"] = "ready"
         coverage = base.vector_coverage()
+        if not state.get("error") and getattr(base, "last_vector_error", ""):
+            state["search_error"] = base.last_vector_error   # semantic search failed on the last question (keywords were used)
         return {"settings": base.settings(), "stats": stats, "sources": base.list_sources(model),
                 "collections": base.collections(),
                 "profiles": base.list_profiles(),

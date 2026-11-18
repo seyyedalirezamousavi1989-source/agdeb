@@ -728,6 +728,15 @@ def render_for_prompt(record, limit):
             from project_digest import build_digest
         digest = build_digest(text, record.get("digest_query") or "", max(limit, 1500), extra=record.get("project_block") or "")
         return f"[پیوست {header}]\n{digest}", True
+    picker = record.get("excerpt_picker")
+    if callable(picker) and len(text) > limit:
+        try:
+            picked = picker(max(limit - 300, 200))
+        except Exception:
+            picked = None
+        if picked:
+            return (f"[پیوست {header} — فایل ({len(text)} نویسه) کامل در زمینه جا نمی‌شد؛ فقط بخش‌هایی که با پرسش فعلی مرتبط‌اند آمده است]\n"
+                    f"{picked}\n[… بقیهٔ فایل حذف شد؛ اگر بخش دیگری لازم است، دقیق‌تر بپرس]"), True
     clipped_text, clipped = _clip(text, max(limit, 200))
     marker = ""
     if clipped or record.get("truncated"):

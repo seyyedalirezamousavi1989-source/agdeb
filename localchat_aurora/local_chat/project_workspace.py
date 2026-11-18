@@ -12,10 +12,18 @@ import threading
 import time
 from pathlib import Path
 
+try:
+    import numpy as np
+except Exception:                                   # numpy is optional: the pure-Python path below is only slower
+    np = None
+
 CHUNK_CHARS = 1800
 CHUNK_OVERLAP = 180
 MAX_CHUNKS_PER_FILE = 600
 MAX_SEMANTIC_CALLS_PER_FILE = 120
+EMBED_CHUNKS_PER_CALL = 48        # chunks embedded while answering one turn; the rest finish on the next turns
+EMBED_BATCH = 16
+MIN_SEMANTIC_SIMILARITY = 0.30
 
 
 def _tokens(value):
@@ -63,6 +71,13 @@ class ProjectWorkspace:
                 );
                 CREATE INDEX IF NOT EXISTS idx_workspace_chunks_attachment
                     ON workspace_chunks(attachment_id, ordinal);
+                CREATE TABLE IF NOT EXISTS workspace_vectors (
+                    chunk_id INTEGER NOT NULL REFERENCES workspace_chunks(id) ON DELETE CASCADE,
+                    model TEXT NOT NULL,
+                    dim INTEGER NOT NULL,
+                    embedding BLOB NOT NULL,
+                    PRIMARY KEY (chunk_id, model)
+                );
                 CREATE TABLE IF NOT EXISTS workspace_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     workspace_id TEXT NOT NULL,
@@ -200,7 +215,77 @@ class ProjectWorkspace:
             return {"indexed": True, "changed": bool(previous), "chunks": len(chunks), "hash": digest,
                     "project_diff": project_diff}
 
-    def retrieve(self, attachment_ids, query, limit=4, max_chars=7000):
+    @staticmethod
+    def _unpack(blob):
+        if np is not None:
+            return np.frombuffer(blob, dtype=np.float32)
+        import array
+        values = array.array("f")
+        values.frombytes(blob)
+        return list(values)
+
+    @staticmethod
+    def _pack(vector):
+        if np is not None:
+            return np.asarray(vector, dtype=np.float32).tobytes()
+        import array
+        return array.array("f", [float(x) for x in vector]).tobytes()
+
+    def _semantic_scores(self, rows, query, embed_texts, embed_model):
+        """{chunk_id: cosine} for the rows, embedding at most EMBED_CHUNKS_PER_CALL missing chunks first.
+
+        Raises on any embedding failure; the caller then falls back to keyword-only ranking.
+        """
+        ids = [row["id"] for row in rows]
+        marks = ",".join("?" for _ in ids)
+        with self._lock, self._connect() as db:
+            have = {r["chunk_id"]: r["embedding"] for r in db.execute(
+                f"SELECT chunk_id, embedding FROM workspace_vectors WHERE model=? AND chunk_id IN ({marks})",
+                [embed_model, *ids]).fetchall()}
+        missing = [row for row in rows if row["id"] not in have][:EMBED_CHUNKS_PER_CALL]
+        for start in range(0, len(missing), EMBED_BATCH):
+            batch = missing[start:start + EMBED_BATCH]
+            vectors = embed_texts([f"{row['name']}\n{row['content']}"[:1800] for row in batch], "document")
+            if len(vectors) != len(batch):
+                raise ValueError("embedding count mismatch")
+            packed = []
+            for row, vector in zip(batch, vectors):
+                values = [float(x) for x in vector]
+                if not values or not any(values) or any(x != x or x in (float("inf"), float("-inf")) for x in values):
+                    raise ValueError("invalid embedding vector")
+                packed.append((row["id"], embed_model, len(values), self._pack(values)))
+                have[row["id"]] = packed[-1][3]
+            with self._lock, self._connect() as db:
+                db.executemany("INSERT OR REPLACE INTO workspace_vectors(chunk_id,model,dim,embedding) VALUES(?,?,?,?)", packed)
+        query_vector = [float(x) for x in embed_texts([query], "query")[0]]
+        scores = {}
+        if np is not None:
+            q = np.asarray(query_vector, dtype=np.float32)
+            qn = float(np.linalg.norm(q)) or 1.0
+            for cid, blob in have.items():
+                v = self._unpack(blob)
+                if v.shape[0] != q.shape[0]:
+                    continue
+                scores[cid] = float(np.dot(q, v) / (qn * (float(np.linalg.norm(v)) or 1.0)))
+        else:
+            qn = sum(x * x for x in query_vector) ** 0.5 or 1.0
+            for cid, blob in have.items():
+                v = self._unpack(blob)
+                if len(v) != len(query_vector):
+                    continue
+                vn = sum(x * x for x in v) ** 0.5 or 1.0
+                scores[cid] = sum(a * b for a, b in zip(query_vector, v)) / (qn * vn)
+        return scores
+
+    def retrieve(self, attachment_ids, query, limit=4, max_chars=7000, embed_texts=None, embed_model="",
+                 min_similarity=MIN_SEMANTIC_SIMILARITY):
+        """Relevant chunks of the given attachments.
+
+        Keyword overlap always works. When ``embed_texts(texts, kind) -> vectors`` and ``embed_model`` are given,
+        chunk vectors are computed lazily (cached in workspace_vectors) and fused with the keyword ranking,
+        so a question can find a passage that does not share a literal word with it. Any embedding failure
+        silently degrades to keyword-only ranking.
+        """
         ids = list(dict.fromkeys(x for x in attachment_ids if re.fullmatch(r"[0-9a-f]{32}", str(x))))[:32]
         if not ids:
             return []
@@ -210,21 +295,43 @@ class ProjectWorkspace:
             rows = db.execute(f"""SELECT c.*, f.name FROM workspace_chunks c
                 JOIN workspace_files f ON f.attachment_id=c.attachment_id
                 WHERE c.attachment_id IN ({placeholders})""", ids).fetchall()
+        semantic = {}
+        if embed_texts is not None and embed_model and rows and str(query or "").strip():
+            try:
+                semantic = self._semantic_scores(rows, str(query), embed_texts, embed_model)
+            except Exception:
+                semantic = {}
         ranked = []
         for row in rows:
-            body = row["content"]
-            body_terms = _tokens(body)
+            body_terms = _tokens(row["content"])
             overlap = len(terms & body_terms) / max(1, len(terms)) if terms else 0.0
+            ranked.append([overlap, row])
+        if semantic:
+            by_keyword = sorted(ranked, key=lambda item: (item[0], -item[1]["ordinal"]), reverse=True)
+            by_vector = sorted((item for item in ranked if semantic.get(item[1]["id"], -1.0) >= min_similarity),
+                               key=lambda item: semantic[item[1]["id"]], reverse=True)
+            fused = {}
+            for rank, item in enumerate(by_keyword):
+                if item[0] > 0:
+                    fused[item[1]["id"]] = fused.get(item[1]["id"], 0.0) + 1.0 / (60 + rank)
+            for rank, item in enumerate(by_vector):
+                fused[item[1]["id"]] = fused.get(item[1]["id"], 0.0) + 1.0 / (60 + rank)
+            for item in ranked:
+                # Scale to the 0..~1 range the keyword path used, so the cut-off below keeps working.
+                item[0] = fused.get(item[1]["id"], 0.0) * 30.0
+        scored = []
+        for overlap, row in ranked:
             # Small positional preference makes early project metadata discoverable without
-            # overriding a clearly better semantic term match.
-            score = overlap + (0.015 if row["ordinal"] == 0 else 0.0)
-            ranked.append((score, row))
-        ranked.sort(key=lambda item: (item[0], -item[1]["ordinal"]), reverse=True)
+            # overriding a clearly better term match.
+            scored.append((overlap + (0.015 if row["ordinal"] == 0 else 0.0), row))
+        scored.sort(key=lambda item: (item[0], -item[1]["ordinal"]), reverse=True)
         out, used = [], 0
-        for score, row in ranked:
+        for score, row in scored:
             if len(out) >= max(1, min(12, int(limit))) or used >= max_chars:
                 break
-            if terms and score <= 0.015:
+            if terms and score <= 0.015 and not semantic:
+                continue
+            if semantic and score <= 0.015:
                 continue
             text = row["content"]
             remaining = max_chars - used
@@ -233,7 +340,8 @@ class ProjectWorkspace:
                 continue
             out.append({"attachment_id": row["attachment_id"], "name": row["name"],
                         "start_char": row["start_char"], "end_char": row["start_char"] + len(text),
-                        "score": round(score, 4), "text": text})
+                        "score": round(score, 4), "text": text,
+                        "via": "semantic" if semantic and semantic.get(row["id"], -1.0) >= min_similarity else "keyword"})
             used += len(text)
         # A short or cross-language follow-up may share no literal tokens with the file
         # (for example asking «توکن چی بود؟» about SECRET-TOKEN-777). In that case
@@ -244,7 +352,7 @@ class ProjectWorkspace:
             if text:
                 out.append({"attachment_id": row["attachment_id"], "name": row["name"],
                             "start_char": row["start_char"], "end_char": row["start_char"] + len(text),
-                            "score": 0.0, "text": text})
+                            "score": 0.0, "text": text, "via": "opening"})
         return out
 
     def status(self):

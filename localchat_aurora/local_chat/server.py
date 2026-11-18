@@ -325,7 +325,7 @@ def _voice_python(package, env_name):
     return None
 
 
-TTS_WORKER_PROTOCOL = 3
+TTS_WORKER_PROTOCOL = 4
 
 
 def _normalized_path(value):
@@ -1000,6 +1000,45 @@ def _knowledge_service():
                 lambda: _ollama_installed_models(),
                 lambda: CHAT_SLOT.locked() or bool(_busy_task_reason()))      # background indexing never competes with a chat OR a long task
         return KNOWLEDGE_SERVICE
+
+
+def _workspace_embedder():
+    """(embed_texts, model) so chat attachments are searched by meaning too; (None, "") when no embedding model is installed."""
+    try:
+        model = _knowledge_service().embedding_model()
+    except Exception:
+        return None, ""
+    if not model:
+        return None, ""
+
+    def embed_texts(texts, kind):
+        prefix = knowledge_module.embed_prefix(model, kind)
+        return _ollama_embed(model, [prefix + text for text in texts])
+    return embed_texts, model
+
+
+def _make_excerpt_picker(record, query):
+    """limit -> text of the passages of ``record`` that best match ``query`` (in document order), or None."""
+    def pick(limit):
+        if not str(query or "").strip():
+            return None
+        WORKSPACES.register(record)                      # no-op when the unchanged file is already indexed
+        embed_texts, embed_model = _workspace_embedder()
+        found = WORKSPACES.retrieve([record["id"]], query, limit=12, max_chars=limit,
+                                    embed_texts=embed_texts, embed_model=embed_model,
+                                    min_similarity=knowledge_module.min_similarity(embed_model))
+        found = [item for item in found if item.get("via") != "opening"]
+        if not found:
+            return None
+        parts, used = [], 0
+        for item in sorted(found, key=lambda x: x["start_char"]):
+            part = f"[کاراکترهای {item['start_char']}-{item['end_char']}]\n{item['text']}"
+            if used + len(part) > limit:
+                break
+            parts.append(part)
+            used += len(part) + 2
+        return "\n\n".join(parts) or None
+    return pick
 
 
 def _resolve_knowledge_selection(service, preferences):
@@ -4419,6 +4458,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             spoken = normalize_for_speech(raw_text) or raw_text.strip()
             audio, mime = b"", "audio/mpeg"
             edge_tried = False
+            worker_device, fallback_note = "", ""
             if provider == "edge_tts":
                 edge_tried = True
                 try:
@@ -4443,6 +4483,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                         with urlopen(req, timeout=300) as r:
                             audio = r.read(32 * 1024 * 1024 + 1)
                             mime = r.headers.get("Content-Type", "audio/wav")
+                            worker_device = r.headers.get("X-TTS-Device", "")
                     except HTTPError as worker_error:
                         detail = worker_error.read(4096).decode("utf-8", errors="replace")
                         try:
@@ -4458,6 +4499,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                         raise
                     # ParsVoice is the user's first choice; when it is unavailable, speak with online Edge TTS instead.
                     print(f"[TTS] ParsVoice failed, falling back to Edge TTS: {type(local_error).__name__}: {local_error}", flush=True)
+                    fallback_note = str(local_error)[:160]
                     try:
                         audio = _edge_tts_audio(spoken, "fa-IR-FaridNeural" if str(cfg.get("voice")) == "fa-IR-FaridNeural" else "fa-IR-DilaraNeural", cfg["rate"])
                         mime = "audio/mpeg"
@@ -4471,6 +4513,11 @@ class ChatHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(audio)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Voice-Provider", provider)
+            if worker_device:
+                self.send_header("X-Voice-Device", worker_device)
+            if fallback_note:
+                # ASCII-only header; the page shows its own Persian wording and the detail stays in the server log
+                self.send_header("X-Voice-Fallback", "edge")
             self.end_headers()
             try:
                 self.wfile.write(audio)
@@ -5470,6 +5517,11 @@ class ChatHandler(BaseHTTPRequestHandler):
                                         record.get("workspace_id"), str(message.get("content") or ""), max_chars=2200)
                                 except Exception:
                                     pass
+                        elif record.get("kind") in ("document", "text") and len(str(record.get("text") or "")) > 6000:
+                            # A long PDF/text used to be cut at its head, so a question about page 80 was never answered.
+                            # Pick the passages that match the question (keywords + meaning) when it does not fit whole.
+                            record = dict(record)
+                            record["excerpt_picker"] = _make_excerpt_picker(record, str(message.get("content") or ""))
                         records.append(record)
                     else:
                         missing += 1
@@ -5522,7 +5574,10 @@ class ChatHandler(BaseHTTPRequestHandler):
                                         pass
                     if prior_ids:
                         try:
-                            excerpts = WORKSPACES.retrieve(prior_ids, query_text, limit=4, max_chars=7000)
+                            embed_texts, embed_model = _workspace_embedder()
+                            excerpts = WORKSPACES.retrieve(prior_ids, query_text, limit=4, max_chars=7000,
+                                                           embed_texts=embed_texts, embed_model=embed_model,
+                                                           min_similarity=knowledge_module.min_similarity(embed_model))
                         except Exception:
                             excerpts = []
                         if excerpts:

@@ -18,7 +18,7 @@ def check(app_dir):
     # The TTS worker is spawned as a separate Python script, so its sibling
     # helper is not guaranteed to be collected by PyInstaller dependency
     # analysis. Verify both files at their runtime import location.
-    for runtime_file in ("tts_worker.py", "persian_speech.py", "stt_worker.py"):
+    for runtime_file in ("tts_worker.py", "persian_speech.py", "speech_audio.py", "stt_worker.py"):
         if not (base / "local_chat" / runtime_file).is_file():
             problems.append(f"فایل {runtime_file} در local_chat خروجی بسته‌بندی‌شده نیست.")
     mt5 = base / "MetaTrader5"

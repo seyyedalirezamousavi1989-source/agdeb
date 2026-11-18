@@ -76,6 +76,7 @@ a = Analysis(
         # tts_worker.py is launched as a standalone script and imports this
         # sibling module at runtime; Analysis does not discover that import.
         (os.path.join(PKG, "persian_speech.py"), "local_chat"),
+        (os.path.join(PKG, "speech_audio.py"), "local_chat"),
         (os.path.join(PKG, "stt_worker.py"), "local_chat"),
     ],
     binaries=[

@@ -67,6 +67,7 @@ a = Analysis(
         (os.path.join(PKG, "smtp_settings.example.json"), "local_chat"),
         (os.path.join(PKG, "tts_worker.py"), "local_chat"),
         (os.path.join(PKG, "persian_speech.py"), "local_chat"),
+        (os.path.join(PKG, "speech_audio.py"), "local_chat"),
         (os.path.join(PKG, "stt_worker.py"), "local_chat"),
     ],
     binaries=[*mt5_binaries, *reportlab_binaries],

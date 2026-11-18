@@ -19,10 +19,11 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import persian_speech  # noqa: E402  (shared, standard-library-only text preparation)
+import speech_audio  # noqa: E402  (numpy-only clean-up of the synthesized pieces)
 
 MODEL_ID = "MohammadJRanjbar/parsvoice-xtts-v2"
 WORKER_ENGINE = "parsvoice-local-xtts-fa-v2"
-WORKER_PROTOCOL_VERSION = 3
+WORKER_PROTOCOL_VERSION = 4
 LATENT_CACHE = {}
 CHUNK_PAUSE_SECONDS = 0.18
 
@@ -34,6 +35,7 @@ def _float_env(name, default, low, high):
         return default
     return min(max(value, low), high)
 MODEL = None
+DEVICE = ""          # "cuda" or "cpu": CPU is many times slower, so the app tells the user when that happened
 MODEL_LOCK = threading.Lock()
 DATA_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData/Local"))) / "LocalChat"
 DEFAULT_MODEL_DIR = DATA_DIR / "voice" / "models" / "ParsVoice-XTTS"
@@ -185,7 +187,7 @@ def _load_local_model(device: str):
 
 
 def load_model():
-    global MODEL
+    global MODEL, DEVICE
     with MODEL_LOCK:
         if MODEL is not None:
             return MODEL
@@ -201,6 +203,7 @@ def load_model():
         ) else "cpu"
         try:
             MODEL = _load_local_model(device)
+            DEVICE = device
         except RuntimeError as exc:
             is_oom = any(marker in str(exc).casefold() for marker in (
                 "out of memory", "cuda error: out of memory", "cublas_status_alloc_failed"
@@ -209,6 +212,9 @@ def load_model():
                 raise
             torch.cuda.empty_cache()
             MODEL = _load_local_model("cpu")
+            DEVICE = "cpu"
+            print("[TTS] GPU out of memory: ParsVoice runs on the CPU (slow). Free VRAM (unload the chat model) "
+                  "or restart the voice engine.", flush=True)
         return MODEL
 
 
@@ -327,8 +333,14 @@ def synthesize(text, speaker_wav):
     pause = np.zeros(int(sample_rate * CHUNK_PAUSE_SECONDS), dtype=np.float32)
     parts = []
     for piece in pieces:
-        parts.append(_synthesize_piece(model, piece, gpt_cond_latent, speaker_embedding))
+        raw = _synthesize_piece(model, piece, gpt_cond_latent, speaker_embedding)
+        # Drop the mumble XTTS sometimes adds after the sentence, and the silence around the speech.
+        parts.append(speech_audio.clean_piece(raw, sample_rate, len(piece)))
         parts.append(pause)
+    skipped = persian_speech.take_unknown_latin_words()
+    if skipped:
+        print("[TTS] Latin words that were not spoken (add them to LocalAppData\\LocalChat\\voice\\speech_words.json): "
+              + ", ".join(skipped), flush=True)
     audio = np.concatenate(parts)
     output = io.BytesIO()
     sf.write(output, audio, sample_rate, format="WAV", subtype="PCM_16")
@@ -368,6 +380,7 @@ class Handler(BaseHTTPRequestHandler):
                 "resolved_model_dir": resolved_dir,
                 "model_files_ok": model_files_ok,
                 "loaded": MODEL is not None,
+                "device": DEVICE,
             })
         else:
             self.send_json(404, {"error": "not found"})
@@ -396,6 +409,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "audio/wav")
             self.send_header("Content-Length", str(len(audio)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-TTS-Device", DEVICE or "unknown")
             self.end_headers()
             self.wfile.write(audio)
         except Exception as exc:

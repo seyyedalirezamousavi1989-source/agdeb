@@ -92,7 +92,7 @@ def test_verify_bundle_flags_missing_mt5_and_numpy_files(tmp_path):
     (internal / "python310.dll").write_text("x")
     speech_dir = internal / "local_chat"
     speech_dir.mkdir(parents=True)
-    for runtime_file in ("tts_worker.py", "persian_speech.py", "stt_worker.py"):
+    for runtime_file in ("tts_worker.py", "persian_speech.py", "speech_audio.py", "stt_worker.py"):
         (speech_dir / runtime_file).write_text("# fixture\n", encoding="utf-8")
     assert module.check(tmp_path) == []
 

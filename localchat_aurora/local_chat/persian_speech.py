@@ -10,8 +10,11 @@ the answer into plain spoken Persian, and ``split_for_speech`` cuts it into
 short sentence-sized chunks, which XTTS reads far more naturally than one long
 paragraph (and which allows playback to start before the whole answer is ready).
 """
+import json
+import os
 import re
 import unicodedata
+from pathlib import Path
 
 MAX_SPEECH_CHARS = 6000
 CHUNK_TARGET = 180
@@ -40,7 +43,7 @@ _LATIN_WORDS = {
     "api": "ای پی آی", "ai": "هوش مصنوعی", "gpu": "جی پی یو", "cpu": "سی پی یو",
     "ram": "رم", "json": "جیسون", "sql": "اس کیو ال", "sqlite": "اس کیو لایت",
     "http": "اچ تی تی پی", "https": "اچ تی تی پی اس", "url": "یو آر ال",
-    "pdf": "پی دی اف", "zip": "زیپ", "wav": "وی", "mp3": "ام پی تری",
+    "pdf": "پی دی اف", "zip": "زیپ", "wav": "ویو", "mp3": "ام پی تری",
     "ok": "اوکی", "email": "ایمیل", "google": "گوگل", "chatgpt": "چت جی پی تی",
     "gpt": "جی پی تی", "claude": "کلود", "anthropic": "آنتروپیک", "openai": "اوپن ای آی",
     "vscode": "وی اس کد", "vs": "وی اس", "code": "کد", "whisper": "ویسپر",
@@ -49,12 +52,65 @@ _LATIN_WORDS = {
     "fastapi": "فست ای پی آی", "firefox": "فایرفاکس", "chrome": "کروم", "edge": "اج",
     "wifi": "وای فای", "bluetooth": "بلوتوث", "usb": "یو اس بی", "pc": "پی سی",
     "app": "اپ", "web": "وب", "site": "سایت", "online": "آنلاین", "offline": "آفلاین",
-    "pip": "پیپ", "npm": "ان پی ام", "venv": "وی انو", "bat": "بت", "ps1": "پی اس وان",
+    "pip": "پیپ", "npm": "ان پی ام", "venv": "وی ان وی", "bat": "بچ", "ps1": "پی اس وان",
     "ui": "یو آی", "ux": "یو ایکس", "id": "آی دی", "ip": "آی پی", "dns": "دی ان اس",
     "ssh": "اس اس اچ", "os": "او اس", "ide": "آی دی ای", "cuda": "کودا",
     "nvidia": "انویدیا", "rtx": "آر تی ایکس", "gb": "گیگابایت", "mb": "مگابایت",
     "kb": "کیلوبایت", "ms": "میلی ثانیه",
+    "data": "دیتا", "database": "دیتابیس", "server": "سرور", "client": "کلاینت", "file": "فایل",
+    "folder": "پوشه", "model": "مدل", "token": "توکن", "prompt": "پرامپت", "agent": "ایجنت",
+    "chat": "چت", "bot": "بات", "bug": "باگ", "debug": "دیباگ", "test": "تست", "build": "بیلد",
+    "commit": "کامیت", "push": "پوش", "pull": "پول", "branch": "برنچ", "merge": "مرج",
+    "repo": "ریپو", "link": "لینک", "login": "لاگین", "password": "پسورد", "user": "یوزر",
+    "setting": "ستینگ", "settings": "ستینگز", "update": "آپدیت", "install": "اینستال",
+    "download": "دانلود", "upload": "آپلود", "mt5": "ام تی فایو", "metatrader": "متاتریدر",
+    "forex": "فارکس", "gold": "گلد", "xauusd": "ایکس ای یو یو اس دی", "eurusd": "یورو دلار",
+    "sl": "اس ال", "tp": "تی پی", "rsi": "آر اس آی", "macd": "مکدی", "ema": "ای ام ای",
+    "sma": "اس ام ای", "atr": "ای تی آر", "bge": "بی جی ای", "embedding": "امبدینگ",
+    "pwa": "پی دبلیو ای", "tailscale": "تیل اسکیل", "aurora": "آرورا", "edge": "اج",
 }
+
+# The user can teach the speech engine words it does not know (or pronounces badly) without touching the code:
+# {"kubernetes": "کوبرنتیس", "mt5": "ام تی فایو"} in LocalAppData\LocalChat\voice\speech_words.json
+# (or the file named by LOCALCHAT_SPEECH_WORDS). Reloaded automatically when the file changes.
+_USER_WORDS = {"path": None, "mtime": None, "words": {}}
+_UNKNOWN_LATIN = set()
+
+
+def _user_words_path():
+    configured = os.environ.get("LOCALCHAT_SPEECH_WORDS", "").strip().strip('"')
+    if configured:
+        return Path(os.path.expandvars(configured)).expanduser()
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    return Path(base) / "LocalChat" / "voice" / "speech_words.json"
+
+
+def user_words():
+    try:
+        path = _user_words_path()
+        mtime = path.stat().st_mtime_ns if path.is_file() else None
+    except OSError:
+        return {}
+    if _USER_WORDS["path"] == path and _USER_WORDS["mtime"] == mtime:
+        return _USER_WORDS["words"]
+    words = {}
+    if mtime is not None:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                words = {str(k).casefold(): str(v) for k, v in data.items()
+                         if isinstance(k, str) and isinstance(v, str) and 0 < len(k) <= 40 and 0 < len(v) <= 80}
+        except (OSError, ValueError):
+            words = {}
+    _USER_WORDS.update(path=path, mtime=mtime, words=words)
+    return words
+
+
+def take_unknown_latin_words():
+    """Latin words dropped from speech since the last call (so the worker can tell the user which ones to teach it)."""
+    found = sorted(_UNKNOWN_LATIN)
+    _UNKNOWN_LATIN.clear()
+    return found
 
 _SYMBOLS = {
     "%": " درصد ", "٪": " درصد ", "+": " به علاوه ", "=": " مساوی ", "&": " و ",
@@ -145,10 +201,15 @@ def _replace_number(match):
 def _replace_latin(match):
     word = match.group(0)
     lowered = word.lower()
+    custom = user_words()
+    if lowered in custom:
+        return " " + custom[lowered] + " "
     if lowered in _LATIN_WORDS:
         return " " + _LATIN_WORDS[lowered] + " "
     if word.isupper() and len(word) <= 5:
         return " " + " ".join(_LETTER_NAMES.get(char.lower(), "") for char in word) + " "
+    if len(_UNKNOWN_LATIN) < 50:
+        _UNKNOWN_LATIN.add(lowered)
     return " "  # unknown foreign word: the Persian model would only garble it
 
 
@@ -245,7 +306,21 @@ def split_for_speech(text, target=CHUNK_TARGET, minimum=CHUNK_MIN):
             chunks[-1] = f"{chunks[-1]} {current}"
         else:
             chunks.append(current)
-    return chunks
+    return [finished for finished in (_finish_chunk(chunk) for chunk in chunks) if finished]
+
+
+def _finish_chunk(chunk):
+    """Every spoken chunk must end with a full stop.
+
+    A chunk that ends in a comma (long sentences are cut at commas) or in no punctuation at all makes XTTS
+    drag the last word out and mumble after it; a final "." tells the model the sentence is over.
+    """
+    chunk = str(chunk or "").strip().rstrip(", ").strip()
+    if not chunk:
+        return ""
+    if chunk[-1] not in ".!?":
+        chunk += "."
+    return chunk
 
 
 def _split_long_sentence(sentence, target):

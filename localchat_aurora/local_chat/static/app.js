@@ -813,12 +813,81 @@ function playBrowserPersianSpeech(text, button) {
     }
   });
 }
+const voiceNotified={cpu:false,edge:false};
+function noteVoiceHeaders(r){
+  try{
+    if(r.headers.get("X-Voice-Device")==="cpu"&&!voiceNotified.cpu){voiceNotified.cpu=true;showToast("ParsVoice روی CPU اجرا می‌شود و کند است (حافظهٔ GPU پر است). مدل گفتگو را آزاد کن یا موتور صدا را دوباره راه‌اندازی کن.");}
+    if(r.headers.get("X-Voice-Fallback")==="edge"&&!voiceNotified.edge){voiceNotified.edge=true;showToast("ParsVoice در دسترس نبود و این صدا با Edge ساخته شد؛ در تنظیمات صدا «عیب‌یابی صدا» را بزن.");}
+  }catch(_){}
+}
+// Long answers are spoken sentence group by sentence group: the first group starts playing after a few seconds
+// while the next one is already being synthesized, instead of waiting for the whole answer.
+function splitSpeechPieces(text){
+  const clean=String(text||"").replace(/```[\s\S]*?```/g," ").trim().slice(0,6000);
+  const sentences=(clean.match(/[^.!?؟…\n]+[.!?؟…]*/g)||[]).map(x=>x.trim()).filter(Boolean);
+  const pieces=[]; let cur="";
+  for(const sentence of sentences){
+    const limit=pieces.length===0?140:260;
+    if(cur&&cur.length+1+sentence.length>limit){pieces.push(cur);cur=sentence;}
+    else cur=cur?cur+" "+sentence:sentence;
+  }
+  if(cur)pieces.push(cur);
+  return pieces;
+}
 async function playVoice(text,button){
+  const pieces=splitSpeechPieces(text);
+  if(pieces.length<2)return playVoiceSingle(text,button);
+  stopVoice(false); const controller=new AbortController(); voiceController=controller;
+  button.disabled=true; button.classList.add("is-loading");
+  const fetchBlob=async(index)=>{
+    const r=await fetchVoiceAudio(pieces[index],controller.signal);
+    if(!r.ok){let d={};try{d=await r.json()}catch(_){} throw new Error(d.error||`تولید صدا ناموفق بود (HTTP ${r.status}).`)}
+    noteVoiceHeaders(r);
+    const raw=await r.blob();
+    if(!raw.size)throw new Error("سرور پاسخ صوتی خالی برگرداند.");
+    const kind=sniffAudioKind(new Uint8Array(await raw.slice(0,16).arrayBuffer()));
+    if(!kind)throw new Error("پاسخ سرور فایل صوتی معتبر نیست.");
+    return new Blob([raw],{type:AUDIO_MIME[kind]});
+  };
+  let started=false, fallback=false;
+  try{
+    let next=fetchBlob(0);
+    for(let index=0;index<pieces.length;index++){
+      const blob=await next;
+      if(controller.signal.aborted)return;
+      next=index+1<pieces.length?fetchBlob(index+1):null;
+      if(next)next.catch(()=>{});            // a failure here is raised when the loop awaits this piece
+      const url=URL.createObjectURL(blob); const audio=new Audio(url); voiceAudio=audio;
+      try{
+        await new Promise((resolve,reject)=>{
+          const onAbort=()=>resolve();
+          controller.signal.addEventListener("abort",onAbort,{once:true});
+          audio.addEventListener("ended",()=>{controller.signal.removeEventListener("abort",onAbort);resolve();},{once:true});
+          audio.addEventListener("error",()=>reject(new Error("پخش قطعهٔ صوتی ناموفق بود.")),{once:true});
+          audio.play().then(()=>{if(!started){started=true;button.disabled=false;button.dataset.playing="1";button.classList.remove("is-loading");}}).catch(reject);
+        });
+      }finally{URL.revokeObjectURL(url);}
+      if(controller.signal.aborted)return;
+    }
+  }catch(e){
+    if(e.name!=="AbortError"&&!controller.signal.aborted){
+      if(started)showToast(e.message);
+      else fallback=true;                    // nothing played yet: use the one-piece path with its browser-speech fallback
+    }
+  }finally{
+    if(voiceController===controller)voiceController=null;
+    voiceAudio=null;
+    if(!fallback){button.disabled=false;button.innerHTML=ACTION_ICONS.speak;button.title="پخش صوتی پاسخ";button.dataset.playing="0";button.classList.remove("is-loading");}
+  }
+  if(fallback)return playVoiceSingle(text,button);
+}
+async function playVoiceSingle(text,button){
   stopVoice(false); const controller=new AbortController(); voiceController=controller; button.disabled=true; button.classList.add("is-loading");
   let objectUrl=null, audioContext=null, sourceNode=null;
   try{
     const r=await fetchVoiceAudio(text,controller.signal);
     if(!r.ok){let d={};try{d=await r.json()}catch(_){} throw new Error(d.error||`تولید صدا ناموفق بود (HTTP ${r.status}).`)}
+    noteVoiceHeaders(r);
     const raw=await r.blob();
     if(!raw.size)throw new Error("سرور پاسخ صوتی خالی برگرداند.");
     const head=new Uint8Array(await raw.slice(0,16).arrayBuffer());
