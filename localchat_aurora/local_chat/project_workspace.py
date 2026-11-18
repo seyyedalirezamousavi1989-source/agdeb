@@ -24,6 +24,12 @@ MAX_SEMANTIC_CALLS_PER_FILE = 120
 EMBED_CHUNKS_PER_CALL = 48        # chunks embedded while answering one turn; the rest finish on the next turns
 EMBED_BATCH = 16
 MIN_SEMANTIC_SIMILARITY = 0.30
+# Function words that say nothing about a document: with the cue-free (strict) retrieval a question like
+# «این چطوره؟» must not "match" a chunk only because both contain «این».
+_STOP = frozenset("""این آن اون اینو اونو که را رو از در به با برای تا هم یا اگر ولی اما است هست بود باشه باشد میشه می شه
+کن کنی کنید کرد کردن چی چیه چیست چه چرا کی کجا چطور چطوره چگونه من تو ما شما او ایشان آیا بله نه خیلی یه یک
+the is are was were to of and or in on for with this that it as at be by an a what how why who where which can you
+please""".split())
 
 
 def _tokens(value):
@@ -278,7 +284,7 @@ class ProjectWorkspace:
         return scores
 
     def retrieve(self, attachment_ids, query, limit=4, max_chars=7000, embed_texts=None, embed_model="",
-                 min_similarity=MIN_SEMANTIC_SIMILARITY):
+                 min_similarity=MIN_SEMANTIC_SIMILARITY, strict=False):
         """Relevant chunks of the given attachments.
 
         Keyword overlap always works. When ``embed_texts(texts, kind) -> vectors`` and ``embed_model`` are given,
@@ -290,6 +296,11 @@ class ProjectWorkspace:
         if not ids:
             return []
         terms = _tokens(query)
+        if strict:
+            # No cue word asked for the file: only a real topical match may bring its text into the prompt.
+            terms = {t for t in terms if t not in _STOP}
+            if not terms and not (embed_texts is not None and embed_model):
+                return []
         placeholders = ",".join("?" for _ in ids)
         with self._lock, self._connect() as db:
             rows = db.execute(f"""SELECT c.*, f.name FROM workspace_chunks c
@@ -305,6 +316,8 @@ class ProjectWorkspace:
         for row in rows:
             body_terms = _tokens(row["content"])
             overlap = len(terms & body_terms) / max(1, len(terms)) if terms else 0.0
+            if strict and overlap < 0.5:
+                overlap = 0.0
             ranked.append([overlap, row])
         if semantic:
             by_keyword = sorted(ranked, key=lambda item: (item[0], -item[1]["ordinal"]), reverse=True)
@@ -333,6 +346,8 @@ class ProjectWorkspace:
                 continue
             if semantic and score <= 0.015:
                 continue
+            if strict and score <= 0.015:
+                continue
             text = row["content"]
             remaining = max_chars - used
             text = text[:remaining]
@@ -346,7 +361,7 @@ class ProjectWorkspace:
         # A short or cross-language follow-up may share no literal tokens with the file
         # (for example asking «توکن چی بود؟» about SECRET-TOKEN-777). In that case
         # provide one bounded opening chunk rather than silently losing file access.
-        if not out and rows and max_chars > 0:
+        if not out and rows and max_chars > 0 and not strict:
             row = min(rows, key=lambda item: (item["ordinal"], item["start_char"]))
             text = row["content"][:min(CHUNK_CHARS, max_chars)]
             if text:

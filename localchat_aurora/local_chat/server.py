@@ -1355,13 +1355,22 @@ _TECHNICAL_CONTEXT = re.compile(
     r"\bobject\b|\bclass\b|دیتابیس|پایگاه\s*داده|\bsql\b)",
     re.I,
 )
-MAX_META_QUESTION_CHARS = 160
+# The instant (no-model) answers are only for a short, standalone question. A keyword inside a longer or
+# multi-part message is NOT a question about the assistant («سازندهٔ فیلم کیه؟», «اسم علیرضا را توی متن بیاور»):
+# those go to the model, which always receives the creator/identity facts anyway.
+MAX_META_QUESTION_CHARS = 70
+MAX_META_QUESTION_WORDS = 9
 
 
 def _is_plain_meta_question(text, value):
     if not isinstance(text, str) or len(text) > MAX_META_QUESTION_CHARS:
         return False
-    if "```" in text or "\n\n" in text.strip():
+    if "```" in text or "\n" in text.strip():
+        return False
+    if len(value.split()) > MAX_META_QUESTION_WORDS:
+        return False
+    body = value.rstrip(" .!?؟")
+    if re.search(r"[.!?؟:;،,\"«»]", body) or re.search(r"\d", body):     # two sentences / quoted text / numbers
         return False
     return not _TECHNICAL_CONTEXT.search(value)
 
@@ -1370,17 +1379,19 @@ def _creator_question_answer(text):
     value = _normalize_capability_text(text)
     if not _is_plain_meta_question(text, value):
         return None
+    # «سازنده» alone is also «the maker of the film / of a class»: it must be addressed to the assistant.
     creator_mention = bool(
         re.search(
-            r"(?:سازند\w*|خالق\w*|your\s+creator|who\s+(?:created|made|built|developed|owns)\s+you|"
+            r"(?:(?:سازند|خالق)\w*\s*(?:ت|ات|ش|اش|تو|شما|تون|اتون|ی\s*تو|ی\s*شما)(?:\s|$|[؟?!.])|"
+            r"(?:سازند|خالق)\w*\s*(?:این|همین)\s*(?:ایجنت|برنامه|دستیار|هوش\s*مصنوعی|ربات|بات)|"
+            r"your\s+creator|who\s+(?:created|made|built|developed|owns)\s+you|"
             r"(?:created|made|built|developed)\s+you)",
             value,
         )
     )
     asks_creator = bool(
         re.search(
-            r"(?:کی|چه\s*کسی|کیه|کیست|چیست|who|what|"
-            r"معرفی|معرف|بگو|tell\s+me|introduce)",
+            r"(?:\bکی\b|چه\s*کسی|کیه|کیست|اسم|نام|\bwho\b|\bname\b|معرفی|معرف|introduce)",
             value,
         )
     )
@@ -1401,7 +1412,7 @@ def _creator_question_answer(text):
     )
     creator_name = _normalize_capability_text(CREATOR["name"])
     asks_about_named_creator = creator_name in value and bool(
-        re.search(r"(?:کی|چه\s*کسی|کیه|کیست|چیست|who|what|معرفی|بگو)", value)
+        re.search(r"(?:^|\s)(?:کیه|کیست|چه\s*کسی(?:ه|\s*است)?|who\s+is|who's)(?:\s|$|[؟?])", value)
     )
     self_intro = bool(
         re.search(r"(?:خودتو|خودت را|yourself)", value)
@@ -5530,7 +5541,11 @@ class ChatHandler(BaseHTTPRequestHandler):
                 query_text = str(message.get("content") or "")
                 followup_cues = ("فایل", "سند", "متن", "محتوا", "توکن", "کلمه", "قسمت", "ادامه", "همون", "همان",
                                  "پروژه", "کد", "خطا", "بخش", "document", "file", "text", "content", "token", "continue", "that", "project", "code")
-                if any(cue in query_text.casefold() for cue in followup_cues):
+                # A cue word («فایل»، «سند»…) makes the file the topic for sure. Without one the file is still
+                # searched (strictly: only a real topical match is added), so the user need not choose words
+                # carefully to get an answer from a document attached earlier.
+                cue_hit = any(cue in query_text.casefold() for cue in followup_cues)
+                if cue_hit or (index == active_user_index and query_text.strip()):
                     seen_ids = set(active_ids)
                     prior_ids = []
                     for prior in recent[:index]:
@@ -5549,6 +5564,8 @@ class ChatHandler(BaseHTTPRequestHandler):
                                     WORKSPACES.register(record)
                                 except Exception:
                                     pass
+                                if record.get("kind") == "archive" and not cue_hit:
+                                    continue          # a whole-project digest is large: only when the message is about the project
                                 if record.get("kind") == "archive" and payload.get("mode") == "programming":
                                     continue          # programming mode edits the imported project on disk; no pasted digest
                                 if record.get("kind") == "archive" and record.get("text"):
@@ -5577,7 +5594,8 @@ class ChatHandler(BaseHTTPRequestHandler):
                             embed_texts, embed_model = _workspace_embedder()
                             excerpts = WORKSPACES.retrieve(prior_ids, query_text, limit=4, max_chars=7000,
                                                            embed_texts=embed_texts, embed_model=embed_model,
-                                                           min_similarity=knowledge_module.min_similarity(embed_model))
+                                                           min_similarity=knowledge_module.min_similarity(embed_model),
+                                                           strict=not cue_hit)
                         except Exception:
                             excerpts = []
                         if excerpts:

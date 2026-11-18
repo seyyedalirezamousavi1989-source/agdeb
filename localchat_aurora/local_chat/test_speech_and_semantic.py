@@ -101,3 +101,34 @@ def test_long_document_uses_relevant_excerpts_instead_of_head():
     plain.pop("excerpt_picker")
     head_block, _ = attach_files.render_for_prompt(plain, 2000)
     assert "QX-7731" not in head_block
+
+
+# ----------------------------------------------------------------------------------------------- keyword gates
+def test_strict_retrieval_needs_a_real_topical_match(tmp_path):
+    store = ProjectWorkspace(tmp_path / "s.sqlite3")
+    record = {"id": "f" * 32, "name": "contract.txt", "kind": "document",
+              "text": "شرایط فسخ قرارداد: هر طرف می‌تواند با اخطار کتبی قرارداد را فسخ کند. " * 30}
+    store.register(record)
+    # no shared topical word and nothing but function words: nothing is injected into the prompt
+    assert store.retrieve([record["id"]], "این چطوره؟", strict=True) == []
+    assert store.retrieve([record["id"]], "امروز هوا چطور است", strict=True) == []
+    # the old loose mode still falls back to the opening chunk
+    assert store.retrieve([record["id"]], "امروز هوا چطور است")
+    # a real topical question is answered without any cue word like «فایل»
+    found = store.retrieve([record["id"]], "شرایط فسخ چیست", strict=True)
+    assert found and "فسخ" in found[0]["text"]
+
+
+def test_instant_answers_only_for_short_standalone_questions():
+    from local_chat import server as sv
+    # genuine questions about the assistant keep the instant answer path
+    assert sv._capability_question_answer("چه قابلیت‌هایی داری؟") is not None
+    # the same words used for something else must reach the model
+    for text in (
+        "سازندهٔ فیلم «تایتانیک» کیه؟",
+        "علیرضا را در متن زیر پیدا کن و بگو قابلیت‌هایش چیست؟ من فکر می‌کنم او مهندس است و در شرکت کار می‌کند",
+        "یه پاراگراف بنویس که توش بگی قابلیت‌های برنامه‌ام چیه. بعدش ترجمه‌اش کن.",
+        "قابلیت‌هات چیه و بعد یک جدول مقایسه با ابزارهای دیگر بساز",
+    ):
+        assert sv._creator_question_answer(text) is None, text
+        assert sv._capability_question_answer(text) is None, text
